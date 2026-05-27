@@ -1,94 +1,213 @@
-# TinyAI
+# llm_kit
 
-这是一个超级轻量级的 AI 聊天插件，你只需要用简单的方式进行配制后即可通过 OpenAI 的标准进行 AI 聊天，支持流式对话、支持 FunctionCall。
+A small LLM client for Flutter & Dart. Rebuilt from TinyAI with three goals:
 
-## 特色功能
+1. **You inject the HTTP transport.** Cookies, interceptors, proxies, a shared
+   Dio instance — whatever your app uses, the library uses. No more singleton
+   `HttpService` you can't reach into.
+2. **Providers are thin and pluggable.** OpenAI-compatible and Anthropic ship
+   in the box; adding one is ~150 lines, not a fork.
+3. **One typed event stream** models text, reasoning/thinking, and tool calls,
+   so new model features (OpenAI's reasoning changes, Anthropic thinking
+   blocks) are new event types — not rewrites.
 
-- 支持流式对话
-- 支持 FunctionCall
-- 使用超简单
+The core has **no Flutter dependency**. It runs in CLIs, servers, and tests.
 
-## 开始使用
+---
 
-用起来超级简单，请看下面的示例代码
+## Architecture
 
-```dart
-TinyAIConfig.instance
-        .setBaseUrl('https://api.openai.com/openai')
-        .setApiKey('sk-test') // 替换为实际的API密钥
-        .setModel('gpt-4')
-        .setLogging(true);
+```
+your app ──► LlmProvider (OpenAI / Anthropic)
+                  │ talks only to ▼
+              LlmTransport  ◄── you implement this (Dio, http, mock)
+                  ▲ default ▼
+              HttpTransport (package:http, shipped)
 
-// 创建客户端和聊天管理器
-final client = OpenAIClient();
-final chatManager = ChatManager(client);
-
-// 添加系统消息
-_chatManager.addSystemMessage('你是一个有用的AI助手，请用中文回复。');
-
-// 添加示例工具
-_chatManager.addTool(WeatherTool());
-_chatManager.addTool(CalculatorTool());
-
-// 发送消息
-chatManager.sendMessageStream(message)
+ChatSession (optional) ──► drives the multi-turn tool loop,
+                           emits SessionEvents for your UI
 ```
 
-这一切是不是太过简单？让我们看看如何创建一个自定义工具函数。你只需要实现 Function Tool 接口即可，插件会自动调用函数，只管逻辑无需关注流程。
+---
+
+## The thing you asked for: injecting Dio (cookies work)
+
+The whole reason for the rewrite. Write this adapter **once** in your app and
+every provider routes through your cookie-carrying Dio:
 
 ```dart
-// 添加一个简单的计算器工具示例
-class CalculatorTool extends FunctionTool {
-  @override
-  String get name => 'calculate';
+import 'package:dio/dio.dart';
+import 'package:llm_kit/llm_kit.dart';
+
+class DioTransport implements LlmTransport {
+  DioTransport(this.dio);
+  final Dio dio; // your configured instance: CookieManager, interceptors, etc.
 
   @override
-  String get description => '执行基本的数学计算';
-
-  @override
-  Map<String, dynamic> get parameters => {
-    'type': 'object',
-    'properties': {
-      'expression': {'type': 'string', 'description': '数学表达式，例如: 2+2, 10*5, sqrt(16)'},
-    },
-    'required': ['expression'],
-  };
-
-  @override
-  Future<String> handler(Map<String, dynamic> arguments) async {
-    final expression = arguments['expression'] as String;
-
-    try {
-      // 这里可以使用 math_expressions 包来解析表达式
-      // 为了简化，我们只处理一些基本情况
-      if (expression.contains('+')) {
-        final parts = expression.split('+');
-        final result = double.parse(parts[0].trim()) + double.parse(parts[1].trim());
-        return '计算结果: $expression = $result';
-      } else if (expression.contains('-')) {
-        final parts = expression.split('-');
-        final result = double.parse(parts[0].trim()) - double.parse(parts[1].trim());
-        return '计算结果: $expression = $result';
-      } else if (expression.contains('*')) {
-        final parts = expression.split('*');
-        final result = double.parse(parts[0].trim()) * double.parse(parts[1].trim());
-        return '计算结果: $expression = $result';
-      } else if (expression.contains('/')) {
-        final parts = expression.split('/');
-        final result = double.parse(parts[0].trim()) / double.parse(parts[1].trim());
-        return '计算结果: $expression = $result';
-      } else {
-        return '无法解析表达式: $expression';
-      }
-    } catch (e) {
-      return '计算错误: $e';
+  Future<LlmResponse> send(LlmRequest req) async {
+    final res = await dio.request<List<int>>(
+      req.url.toString(),
+      data: req.body,
+      options: Options(
+        method: req.method,
+        headers: req.headers,
+        responseType: ResponseType.bytes,
+        // Let llm_kit surface non-2xx as TransportException uniformly:
+        validateStatus: (_) => true,
+        sendTimeout: req.timeout,
+        receiveTimeout: req.timeout,
+      ),
+    );
+    final bytes = Uint8List.fromList(res.data ?? const []);
+    final code = res.statusCode ?? 0;
+    if (code < 200 || code >= 300) {
+      throw TransportException('HTTP $code',
+          statusCode: code, uri: req.url,
+          responseBody: utf8.decode(bytes, allowMalformed: true));
     }
+    return LlmResponse(
+      statusCode: code,
+      headers: res.headers.map.map((k, v) => MapEntry(k, v.join(','))),
+      bodyBytes: bytes,
+    );
+  }
+
+  @override
+  Stream<List<int>> sendStream(LlmRequest req) async* {
+    final res = await dio.request<ResponseBody>(
+      req.url.toString(),
+      data: req.body,
+      options: Options(
+        method: req.method,
+        headers: req.headers,
+        responseType: ResponseType.stream,
+        validateStatus: (_) => true,
+      ),
+    );
+    final code = res.statusCode ?? 0;
+    if (code < 200 || code >= 300) {
+      final body = await res.data!.stream
+          .map(utf8.decode).join();
+      throw TransportException('HTTP $code', statusCode: code, uri: req.url,
+          responseBody: body);
+    }
+    yield* res.data!.stream.map((chunk) => chunk.toList());
+  }
+
+  @override
+  void close() => dio.close();
+}
+```
+
+Wire it up:
+
+```dart
+final dio = Dio()..interceptors.add(CookieManager(cookieJar));
+final provider = OpenAIProvider(
+  transport: DioTransport(dio),
+  apiKey: '...',
+  baseUrl: 'https://your-gateway.example.com/v1', // cookie-gated endpoint
+);
+```
+
+Nothing else changes. The cookie jar travels with every request and stream.
+
+---
+
+## Quick start (default transport)
+
+```dart
+final provider = OpenAIProvider(
+  transport: HttpTransport(),
+  apiKey: const String.fromEnvironment('OPENAI_KEY'),
+  defaultModel: 'gpt-4o-mini',
+);
+
+// Non-streaming
+final res = await provider.chat([
+  Message.system('You are concise.'),
+  Message.user('One sentence on why Dart isolates matter.'),
+]);
+print(res.content);
+
+// Streaming, with typed events
+await for (final ev in provider.chatStream([Message.user('Count to 3.')])) {
+  switch (ev) {
+    case TextDelta(:final text): stdout.write(text);
+    case ReasoningDelta(:final text): /* show in a thinking panel */;
+    case ToolCallStarted(:final name): print('\n[calling $name…]');
+    case StreamDone(:final usage): print('\n[${usage?.totalTokens} tok]');
+    default: break;
   }
 }
 ```
 
-## 图片示例：
+## Reasoning / thinking
 
-![home](example/assets/home.jpg)
+Both providers accept a neutral `reasoningEffort`; each maps it to its own
+mechanism (OpenAI `reasoning_effort` + `max_completion_tokens`; Anthropic a
+`thinking` budget). Reasoning text arrives as `ReasoningDelta`, separate from
+visible `TextDelta`, so you can render it differently.
 
-![chat](example/assets/chat.jpg)
+```dart
+final opts = ChatOptions(model: 'gpt-5.1', reasoningEffort: ReasoningEffort.high);
+await for (final ev in provider.chatStream(msgs, options: opts)) { /* ... */ }
+```
+
+> Note: some current OpenAI reasoning models default `reasoning_effort` to
+> `none`, so you must pass it explicitly to get thinking. llm_kit only sends it
+> when you set it.
+
+## Anthropic
+
+```dart
+final claude = AnthropicProvider(
+  transport: HttpTransport(),
+  apiKey: '...',
+  defaultModel: 'claude-opus-4-7',
+);
+```
+
+System messages are lifted into the top-level `system` field automatically;
+tool results are coalesced into the user turn Anthropic expects.
+
+## Tools + the session layer
+
+```dart
+final session = ChatSession(provider, tools: [
+  Tool(
+    name: 'get_weather',
+    description: 'Current weather for a city',
+    parameters: {
+      'type': 'object',
+      'properties': {'city': {'type': 'string'}},
+      'required': ['city'],
+    },
+    execute: (args) async => '{"temp":22,"sky":"clear"}',
+  ),
+]);
+
+await for (final ev in session.send('Weather in Tokyo?')) {
+  switch (ev) {
+    case SessionToolCallStart(:final name): print('▶ $name');
+    case SessionToolCallEnd(:final name): print('✓ $name');
+    case SessionText(:final delta): stdout.write(delta);
+    default: break;
+  }
+}
+```
+
+`ChatSession` runs the full request → tool calls → execute → re-request loop
+for you, and is pure Dart — wrap it in a `ValueNotifier`, Bloc, or Riverpod
+notifier as you like. (The old `ChatManager extends ChangeNotifier` is gone on
+purpose; it forced one state solution onto everyone.)
+
+## What was dropped from TinyAI
+
+- **Singletons** (`TinyAIConfig.instance`, `HttpService.instance`) — replaced
+  by explicit construction so you can run two providers at once.
+- **MCP** — removed per your request.
+- **Title generation inside the provider** — that's an app concern; do it with
+  a normal `chat()` call.
+- **`MessageStatus` on the message model** — UI state doesn't belong in the
+  protocol layer.

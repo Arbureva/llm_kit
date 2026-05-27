@@ -1,6 +1,6 @@
 {
-    "name": "tiny_ai_example",
-    "short_name": "tiny_ai_example",
+    "name": "llm_kit_example",
+    "short_name": "llm_kit_example",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
