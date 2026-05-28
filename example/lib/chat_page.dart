@@ -149,6 +149,8 @@ class _ChatPageState extends State<ChatPage> {
       await for (final ev in _session!.send(text, options: options)) {
         // 这里就是「靠事件驱动界面」的核心：根据事件类型更新 UI。
         switch (ev) {
+          case SessionTitleGenerated(:final title):
+            _session?.title = title;
           case SessionText(:final delta):
             setState(() => assistant.text += delta);
             _scrollToBottom();

@@ -358,31 +358,31 @@ class ChatSession {
       return t.length <= 40 ? t : '${t.substring(0, 40)}…';
     }
 
-    String? generated;
-    try {
-      final buf = StringBuffer();
-      await for (final ev in provider.chatStream(
-        [
-          Message.system(
-            'Summarize the conversation as a short title in the same '
-            'language as the user. Max 6 words, no quotes, no punctuation '
-            'at the end. Reply with the title only.',
-          ),
-          Message.user(firstUser ?? ''),
-        ],
-        options: options,
-        tools: null,
-      )) {
-        if (ev case TextDelta(:final text)) buf.write(text);
-      }
-      final s = buf.toString().trim().replaceAll('"', '');
-      if (s.isNotEmpty) generated = s.length <= 60 ? s : s.substring(0, 60);
-    } catch (_) {
-      generated = null;
-    }
+    // String? generated;
+    // try {
+    //   final buf = StringBuffer();
+    //   await for (final ev in provider.chatStream(
+    //     [
+    //       Message.system(
+    //         'Summarize the conversation as a short title in the same '
+    //         'language as the user. Max 6 words, no quotes, no punctuation '
+    //         'at the end. Reply with the title only.',
+    //       ),
+    //       Message.user(firstUser ?? ''),
+    //     ],
+    //     options: options,
+    //     tools: null,
+    //   )) {
+    //     if (ev case TextDelta(:final text)) buf.write(text);
+    //   }
+    //   final s = buf.toString().trim().replaceAll('"', '');
+    //   if (s.isNotEmpty) generated = s.length <= 60 ? s : s.substring(0, 60);
+    // } catch (_) {
+    //   generated = null;
+    // }
 
-    title = generated ?? fallback();
-    yield SessionTitleGenerated(title!);
+    // title = generated ?? fallback();
+    yield SessionTitleGenerated(fallback());
   }
 }
 
