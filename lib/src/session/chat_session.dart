@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 
 import '../core/message.dart';
 import '../core/provider.dart';
@@ -52,6 +53,11 @@ class SessionText extends SessionEvent {
 class SessionReasoning extends SessionEvent {
   const SessionReasoning(this.delta);
   final String delta;
+}
+
+class SessionTitleGenerated extends SessionEvent {
+  const SessionTitleGenerated(this.title);
+  final String title;
 }
 
 /// The model has begun requesting a tool call. Fires as soon as id + name are
@@ -159,7 +165,9 @@ class ChatSession {
     List<Tool> tools = const [],
     this.dispatcher,
     this.maxToolRounds = 5,
-  }) : _tools = List.of(tools);
+    String? id,
+  })  : _tools = List.of(tools),
+        id = id ?? _uuidV4();
 
   final LlmProvider provider;
   final int maxToolRounds;
@@ -173,6 +181,13 @@ class ChatSession {
 
   List<Message> get messages => List.unmodifiable(_messages);
   List<Tool> get tools => List.unmodifiable(_tools);
+
+  /// Stable identifier, assigned at construction.
+  final String id;
+
+  /// Human-readable title. Null until the first turn completes and a summary
+  /// is generated (falling back to the first user message on failure).
+  String? title;
 
   void addTool(Tool tool) => _tools.add(tool);
   void setSystem(String content) {
@@ -251,6 +266,9 @@ class ChatSession {
 
       // No tools requested → conversation turn is complete.
       if (pending.isEmpty) {
+        if (title == null) {
+          yield* _ensureTitle(options);
+        }
         yield SessionDone(usage: usage, reason: SessionStopReason.completed);
         return;
       }
@@ -328,6 +346,44 @@ class ChatSession {
     // Fell out of the loop without the model stopping: rounds exhausted.
     yield const SessionDone(reason: SessionStopReason.maxRoundsReached);
   }
+
+  /// Generate a short title from the conversation so far. Asks the model for a
+  /// summary; on any failure falls back to the first user message (trimmed).
+  Stream<SessionEvent> _ensureTitle(ChatOptions? options) async* {
+    final firstUser = _messages.where((m) => m.role == Role.user).map((m) => m.content).whereType<String>().firstOrNull;
+
+    String fallback() {
+      final t = (firstUser ?? '').trim();
+      if (t.isEmpty) return 'New chat';
+      return t.length <= 40 ? t : '${t.substring(0, 40)}…';
+    }
+
+    String? generated;
+    try {
+      final buf = StringBuffer();
+      await for (final ev in provider.chatStream(
+        [
+          Message.system(
+            'Summarize the conversation as a short title in the same '
+            'language as the user. Max 6 words, no quotes, no punctuation '
+            'at the end. Reply with the title only.',
+          ),
+          Message.user(firstUser ?? ''),
+        ],
+        options: options,
+        tools: null,
+      )) {
+        if (ev case TextDelta(:final text)) buf.write(text);
+      }
+      final s = buf.toString().trim().replaceAll('"', '');
+      if (s.isNotEmpty) generated = s.length <= 60 ? s : s.substring(0, 60);
+    } catch (_) {
+      generated = null;
+    }
+
+    title = generated ?? fallback();
+    yield SessionTitleGenerated(title!);
+  }
 }
 
 extension<E> on Iterable<E> {
@@ -335,4 +391,15 @@ extension<E> on Iterable<E> {
     final it = iterator;
     return it.moveNext() ? it.current : null;
   }
+}
+
+String _uuidV4() {
+  final r = Random.secure();
+  final b = List<int>.generate(16, (_) => r.nextInt(256));
+  b[6] = (b[6] & 0x0f) | 0x40; // version 4
+  b[8] = (b[8] & 0x3f) | 0x80; // variant
+  String h(int i) => b[i].toRadixString(16).padLeft(2, '0');
+  final s = b.asMap().keys.map(h).join();
+  return '${s.substring(0, 8)}-${s.substring(8, 12)}-${s.substring(12, 16)}'
+      '-${s.substring(16, 20)}-${s.substring(20)}';
 }
