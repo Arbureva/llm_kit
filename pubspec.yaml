@@ -1,6 +1,6 @@
 name: llm_kit
 description: A small, transport-injectable LLM client for Flutter and Dart with typed streaming events, reasoning support, and pluggable OpenAI/Anthropic providers.
-version: 0.1.0
+version: 2.0.0
 publish_to: none
 
 environment:
