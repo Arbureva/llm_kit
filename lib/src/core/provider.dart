@@ -41,6 +41,7 @@ class ChatOptions {
     this.toolChoice,
     this.reasoningEffort,
     this.extra,
+    this.titlePrompt,
   });
 
   final String? model;
@@ -48,6 +49,7 @@ class ChatOptions {
   final int? maxTokens;
   final double? topP;
   final List<String>? stop;
+  final String? titlePrompt;
 
   /// 'auto' | 'none' | 'required' | a specific tool name.
   final String? toolChoice;
