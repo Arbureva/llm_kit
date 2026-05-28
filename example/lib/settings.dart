@@ -8,7 +8,7 @@ class Settings {
   Settings({
     this.kind = ProviderKind.openai,
     this.apiKey = 'ak_live_4e0fda97d63f587c28435709ed8f9b94',
-    this.baseUrl = 'https://api.iceres.cn:8186/v1',
+    this.baseUrl = 'http://192.168.1.4:8080/v1',
     this.model = 'deepseek-v4-pro',
     this.enableThinking = true,
   });

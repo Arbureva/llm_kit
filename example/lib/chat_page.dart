@@ -20,13 +20,30 @@ class UiBubble {
   bool streaming; // 是否正在打字中
 }
 
-/// 工具调用的一次记录（用来显示那个「正在调用…/完成」的小标签）。
+/// 工具调用的一次记录（用来显示那个「正在调用…/执行中/完成」的小标签）。
 class UiToolCall {
   UiToolCall({required this.id, required this.name});
   final String id;
-  final String name;
-  bool done = false;
+  String name;
+
+  /// 工具当前所处的阶段，驱动小标签的图标和文字。
+  UiToolPhase phase = UiToolPhase.requesting;
   bool isError = false;
+
+  /// 是否是交给后端（dispatcher）执行的。本地执行的工具为 false。
+  bool dispatched = false;
+}
+
+/// 工具调用的生命周期阶段，和库里的 SessionEvent 一一对应。
+enum UiToolPhase {
+  /// 模型刚开始请求（SessionToolCallStarted）—— 参数可能还没传完。
+  requesting,
+
+  /// 参数已传完、正在执行（SessionToolCallExecuting）—— 后端跑工具的「空档期」就在这里。
+  executing,
+
+  /// 执行完成（SessionToolCallEnd）。
+  done,
 }
 
 class ChatPage extends StatefulWidget {
@@ -61,8 +78,30 @@ class _ChatPageState extends State<ChatPage> {
   /// 把当前配置应用上：新建一个 session（带上示例工具）。
   void _rebuildSession() {
     final provider = _settings.buildProvider();
-    _session = ChatSession(provider, tools: [weatherTool]);
+    _session = ChatSession(
+      provider,
+      // tools: [weatherTool],
+      // 没有本地 execute 的工具会走到这里 —— 你的后端（MCP / CLI / skills）在此执行。
+      // 示例工具 weatherTool 自带 execute，所以不会用到这个；
+      // 接后端时把下面替换成真正的调用即可。
+      dispatcher: _dispatchTool,
+    );
     _session!.setSystem('你是一个简洁友好的中文助手。');
+  }
+
+  /// 后端工具派发：AI 请求一个没有本地 execute 的工具时被调用。
+  /// 在这里调用你的后端（MCP / CLI / skills），拿到结果后返回 ToolResult，
+  /// session 会自动把结果喂回模型并继续这一轮。
+  Future<ToolResult> _dispatchTool(ToolCall call) async {
+    // TODO: 换成你真正的后端调用，例如：
+    //   final out = await backend.runTool(call.name, call.arguments);
+    //   return ToolResult(toolCallId: call.id, name: call.name, content: out);
+    return ToolResult(
+      toolCallId: call.id,
+      name: call.name,
+      content: '（占位）后端尚未接入，工具 "${call.name}" 未执行。',
+      isError: true,
+    );
   }
 
   void _scrollToBottom() {
@@ -118,27 +157,45 @@ class _ChatPageState extends State<ChatPage> {
           case SessionReasoning(:final delta):
             setState(() => assistant.reasoning += delta);
 
-          case SessionToolCallStart(:final id, :final name):
-            // 工具一开始调用就冒出标签（此时参数可能还没传完）。
+          case SessionToolCallStarted(:final id, :final name):
+            // 模型一开始请求工具就冒出标签（此时参数可能还没传完）。
             setState(() => _activeTools.add(UiToolCall(id: id, name: name)));
+            _scrollToBottom();
+
+          case SessionToolCallReady():
+            // 参数已传完并解析好。这里不强制做 UI，
+            // 如果想显示「将用什么参数调用」，可以读 ev.parsedArguments。
+            break;
+
+          case SessionToolCallExecuting(:final id, :final name, :final dispatched):
+            // 真正开始执行（本地或交给后端）—— 之前的「空档期」就发生在这一阶段。
+            setState(() {
+              final t = _findOrAddTool(id, name);
+              t.phase = UiToolPhase.executing;
+              t.dispatched = dispatched;
+            });
             _scrollToBottom();
 
           case SessionToolCallEnd(:final id, :final name, :final isError):
             setState(() {
-              final t = _activeTools.lastWhere(
-                (t) => t.id == id,
-                orElse: () => UiToolCall(id: id, name: name)..done = true,
-              );
-              t.done = true;
+              final t = _findOrAddTool(id, name);
+              t.phase = UiToolPhase.done;
               t.isError = isError;
             });
 
-          case SessionDone():
-            break;
+          case SessionDone(:final reason):
+            // 轮次用尽（而非正常结束）时给个提示，避免回复像是无故截断。
+            if (reason == SessionStopReason.maxRoundsReached) {
+              setState(() => assistant.text += '\n\n⚠️ 工具调用轮次已达上限，回复可能未完成。');
+            }
+
+          case SessionError(:final error):
+            setState(() => assistant.text += '\n\n⚠️ 出错了：$error\n（检查 Key / Base URL / 模型名是否正确，以及网络是否能访问该地址）');
         }
       }
     } catch (e) {
-      setState(() => assistant.text += '\n\n⚠️ 出错了：$e\n（检查 Key / Base URL / 模型名是否正确，以及网络是否能访问该地址）');
+      // 兜底：理论上传输错误已由 SessionError 事件覆盖，这里防御未预期的异常。
+      setState(() => assistant.text += '\n\n⚠️ 出错了：$e');
     } finally {
       setState(() {
         assistant.streaming = false;
@@ -146,6 +203,19 @@ class _ChatPageState extends State<ChatPage> {
       });
       _scrollToBottom();
     }
+  }
+
+  /// 按 id 找已有的工具记录，找不到就新建一条（防御事件乱序 / 漏掉 Started）。
+  UiToolCall _findOrAddTool(String id, String name) {
+    for (final t in _activeTools) {
+      if (t.id == id) {
+        t.name = name;
+        return t;
+      }
+    }
+    final t = UiToolCall(id: id, name: name);
+    _activeTools.add(t);
+    return t;
   }
 
   void _showSnack(String msg) {
@@ -311,27 +381,44 @@ class _ChatPageState extends State<ChatPage> {
       child: Wrap(
         spacing: 8,
         runSpacing: 6,
-        children: _activeTools.map((t) {
-          return Chip(
-            visualDensity: VisualDensity.compact,
-            avatar: t.done
-                ? Icon(
-                    t.isError ? Icons.error_outline : Icons.check_circle,
-                    size: 18,
-                    color: t.isError ? Colors.red : Colors.green,
-                  )
-                : const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-            label: Text(
-              t.done ? '已完成：${t.name}' : '正在调用：${t.name}…',
-              style: const TextStyle(fontSize: 13),
-            ),
-          );
-        }).toList(),
+        children: _activeTools.map(_buildToolChip).toList(),
       ),
+    );
+  }
+
+  Widget _buildToolChip(UiToolCall t) {
+    // 根据阶段决定图标和文字。
+    final Widget avatar;
+    final String label;
+    switch (t.phase) {
+      case UiToolPhase.requesting:
+        avatar = const SizedBox(
+          width: 16,
+          height: 16,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        );
+        label = '请求调用：${t.name}…';
+      case UiToolPhase.executing:
+        avatar = const SizedBox(
+          width: 16,
+          height: 16,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        );
+        // 区分本地执行 / 后端执行，让「空档期」有明确说明。
+        label = t.dispatched ? '后端执行中：${t.name}…' : '执行中：${t.name}…';
+      case UiToolPhase.done:
+        avatar = Icon(
+          t.isError ? Icons.error_outline : Icons.check_circle,
+          size: 18,
+          color: t.isError ? Colors.red : Colors.green,
+        );
+        label = t.isError ? '失败：${t.name}' : '已完成：${t.name}';
+    }
+
+    return Chip(
+      visualDensity: VisualDensity.compact,
+      avatar: avatar,
+      label: Text(label, style: const TextStyle(fontSize: 13)),
     );
   }
 
