@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:llm_kit/llm_kit.dart';
 
-import 'demo_tools.dart';
 import 'settings.dart';
 
 /// 一条要显示在屏幕上的内容。我们不直接用库里的 Message，
