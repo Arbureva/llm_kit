@@ -35,19 +35,16 @@ class OpenAIProvider implements LlmProvider {
   final Duration? timeout;
 
   Map<String, String> _headers() => {
-    'Content-Type': 'application/json',
-    'Authorization': 'Bearer $apiKey',
-    ...defaultHeaders,
-  };
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $apiKey',
+        ...defaultHeaders,
+      };
 
   /// Heuristic: o-series and gpt-5+ are reasoning models with different
   /// parameter rules. Override by setting fields explicitly via ChatOptions.extra.
   bool _isReasoningModel(String model) {
     final m = model.toLowerCase();
-    return m.startsWith('o1') ||
-        m.startsWith('o3') ||
-        m.startsWith('o4') ||
-        m.startsWith('gpt-5');
+    return m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4') || m.startsWith('gpt-5');
   }
 
   Map<String, dynamic> _buildBody(
@@ -68,8 +65,7 @@ class OpenAIProvider implements LlmProvider {
 
     // Reasoning models use max_completion_tokens and reject sampling knobs.
     if (options?.maxTokens != null) {
-      body[reasoning ? 'max_completion_tokens' : 'max_tokens'] =
-          options!.maxTokens;
+      body[reasoning ? 'max_completion_tokens' : 'max_tokens'] = options!.maxTokens;
     }
     if (!reasoning) {
       if (options?.temperature != null) body['temperature'] = options!.temperature;
@@ -95,21 +91,33 @@ class OpenAIProvider implements LlmProvider {
     if (choice == 'auto' || choice == 'none' || choice == 'required') {
       return choice;
     }
-    return {'type': 'function', 'function': {'name': choice}};
+    return {
+      'type': 'function',
+      'function': {'name': choice}
+    };
   }
 
   Map<String, dynamic> _toolToJson(Tool t) => {
-    'type': 'function',
-    'function': {
-      'name': t.name,
-      'description': t.description,
-      'parameters': t.parameters,
-    },
-  };
+        'type': 'function',
+        'function': {
+          'name': t.name,
+          'description': t.description,
+          'parameters': t.parameters,
+        },
+      };
 
   Map<String, dynamic> _messageToJson(Message m) {
     final json = <String, dynamic>{'role': m.role.name};
-    if (m.content != null) json['content'] = m.content;
+
+    // 始终输出 content 键。官方 OpenAI 允许 tool_calls 的 assistant 轮省略 content，
+    // 但多数兼容端（DeepSeek/Kimi/Qwen/vLLM…）把它当必填，缺失即 400——
+    // 这恰好只在「工具调用之后的那一轮」才暴露。
+    if (m.role == Role.assistant) {
+      json['content'] = m.content ?? ''; // 可能为 null，但 KEY 必须在
+    } else if (m.content != null) {
+      json['content'] = m.content;
+    }
+
     if (m.name != null) json['name'] = m.name;
     if (m.role == Role.tool && m.toolResult != null) {
       json['tool_call_id'] = m.toolResult!.toolCallId;
@@ -168,19 +176,18 @@ class OpenAIProvider implements LlmProvider {
       promptTokens: raw['prompt_tokens'] as int?,
       completionTokens: raw['completion_tokens'] as int?,
       totalTokens: raw['total_tokens'] as int?,
-      reasoningTokens:
-          details is Map ? details['reasoning_tokens'] as int? : null,
+      reasoningTokens: details is Map ? details['reasoning_tokens'] as int? : null,
     );
   }
 
   FinishReason? _finishReason(String? r) => switch (r) {
-    'stop' => FinishReason.stop,
-    'length' => FinishReason.length,
-    'tool_calls' => FinishReason.toolCalls,
-    'content_filter' => FinishReason.contentFilter,
-    null => null,
-    _ => FinishReason.unknown,
-  };
+        'stop' => FinishReason.stop,
+        'length' => FinishReason.length,
+        'tool_calls' => FinishReason.toolCalls,
+        'content_filter' => FinishReason.contentFilter,
+        null => null,
+        _ => FinishReason.unknown,
+      };
 
   @override
   Stream<StreamEvent> chatStream(
@@ -254,9 +261,7 @@ class OpenAIProvider implements LlmProvider {
           argsBuf.putIfAbsent(index, () => StringBuffer());
 
           // Fire "started" once we know id + name, before args complete.
-          if (!started.contains(index) &&
-              ids.containsKey(index) &&
-              names.containsKey(index)) {
+          if (!started.contains(index) && ids.containsKey(index) && names.containsKey(index)) {
             started.add(index);
             yield ToolCallStarted(
               index: index,
