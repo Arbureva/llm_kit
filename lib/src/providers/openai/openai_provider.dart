@@ -109,21 +109,24 @@ class OpenAIProvider implements LlmProvider {
   Map<String, dynamic> _messageToJson(Message m) {
     final json = <String, dynamic>{'role': m.role.name};
 
-    // 始终输出 content 键。官方 OpenAI 允许 tool_calls 的 assistant 轮省略 content，
-    // 但多数兼容端（DeepSeek/Kimi/Qwen/vLLM…）把它当必填，缺失即 400——
-    // 这恰好只在「工具调用之后的那一轮」才暴露。
-    if (m.role == Role.assistant) {
-      json['content'] = m.content ?? ''; // 可能为 null，但 KEY 必须在
-    } else if (m.content != null) {
-      json['content'] = m.content;
-    }
-
-    if (m.name != null) json['name'] = m.name;
-    if (m.role == Role.tool && m.toolResult != null) {
-      json['tool_call_id'] = m.toolResult!.toolCallId;
-    }
-    if (m.hasToolCalls) {
-      json['tool_calls'] = m.toolCalls!.map((tc) => tc.toJson()).toList();
+    switch (m.role) {
+      case Role.assistant:
+        // 关键：content 必须是字符串、不能是 null。
+        // eino/einobridge 把「带 tool_calls 的 assistant 轮」表示为 content="" + tool_calls，
+        // 收到 content:null 会判定为「未设置」，于是报 content or tool_calls must be set。
+        json['content'] = m.content ?? '';
+        if (m.hasToolCalls) {
+          json['tool_calls'] = m.toolCalls!.map((tc) => tc.toJson()).toList();
+        }
+      case Role.tool:
+        json['content'] = m.content ?? '';
+        if (m.toolResult != null) {
+          json['tool_call_id'] = m.toolResult!.toolCallId;
+        }
+        if (m.name != null) json['name'] = m.name;
+      default: // system / user
+        if (m.content != null) json['content'] = m.content;
+        if (m.name != null) json['name'] = m.name;
     }
     return json;
   }
