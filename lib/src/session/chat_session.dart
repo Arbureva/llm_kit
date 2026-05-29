@@ -221,6 +221,11 @@ class ChatSession {
   Stream<SessionEvent> resume({ChatOptions? options}) => _run(options: options);
 
   Stream<SessionEvent> _run({ChatOptions? options}) async* {
+    // 前端是否有能力执行工具。两者皆无 = 后端在跑循环、并把最终答案随流一起返回，
+    // 流里的 tool_calls 仅供展示：绝不能再循环，也绝不能把这些 tool_calls 落进历史
+    // （它们没有对应的 tool 结果，下一次请求会变成「assistant(tool_calls) 后面没有 tool 消息」→ 400）。
+    final canExecuteTools = _tools.any((t) => t.execute != null) || dispatcher != null;
+
     for (var round = 0; round < maxToolRounds; round++) {
       final textBuf = StringBuffer();
       final reasoningBuf = StringBuffer();
@@ -241,7 +246,7 @@ class ChatSession {
               reasoningBuf.write(text);
               yield SessionReasoning(text);
             case ToolCallStarted(:final id, :final name):
-              yield SessionToolCallStarted(id: id, name: name);
+              yield SessionToolCallStarted(id: id, name: name); // 仍可显示「正在调用…」
             case ToolCallCompleted(:final toolCall):
               pending.add(toolCall);
             case StreamDone(usage: final u):
@@ -256,19 +261,33 @@ class ChatSession {
         return;
       }
 
-      // Record the assistant turn (text + any tool calls it requested).
-      _messages.add(Message(
-        role: Role.assistant,
-        content: textBuf.isEmpty ? null : textBuf.toString(),
-        toolCalls: pending.isEmpty ? null : pending,
-        reasoning: reasoningBuf.isEmpty ? null : reasoningBuf.toString(),
-      ));
-
-      // No tools requested → conversation turn is complete.
-      if (pending.isEmpty) {
-        if (title == null) {
-          yield* _ensureTitle(options);
+      // —— 展示直通模式：后端已执行工具，流里的文本就是完整答案 ——
+      if (!canExecuteTools) {
+        if (textBuf.isNotEmpty || reasoningBuf.isNotEmpty) {
+          _messages.add(Message(
+            role: Role.assistant,
+            content: textBuf.isEmpty ? null : textBuf.toString(),
+            reasoning: reasoningBuf.isEmpty ? null : reasoningBuf.toString(),
+            // 注意：不带 toolCalls
+          ));
         }
+        if (title == null) yield* _ensureTitle(options);
+        yield SessionDone(usage: usage, reason: SessionStopReason.completed);
+        return;
+      }
+
+      // —— 以下是前端自跑工具循环的原逻辑，仅当确有执行能力时才进入 ——
+      if (textBuf.isNotEmpty || pending.isNotEmpty) {
+        _messages.add(Message(
+          role: Role.assistant,
+          content: textBuf.isEmpty ? null : textBuf.toString(),
+          toolCalls: pending.isEmpty ? null : pending,
+          reasoning: reasoningBuf.isEmpty ? null : reasoningBuf.toString(),
+        ));
+      }
+
+      if (pending.isEmpty) {
+        if (title == null) yield* _ensureTitle(options);
         yield SessionDone(usage: usage, reason: SessionStopReason.completed);
         return;
       }
