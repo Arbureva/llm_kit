@@ -69,6 +69,7 @@ class ChatResult {
   const ChatResult({
     required this.content,
     this.reasoning,
+    this.reasoningSignature,
     this.toolCalls,
     this.finishReason,
     this.usage,
@@ -77,6 +78,10 @@ class ChatResult {
 
   final String content;
   final String? reasoning;
+
+  /// Signature for the reasoning block (Anthropic), to round-trip thinking on
+  /// the next turn. Null when the provider doesn't sign thinking.
+  final String? reasoningSignature;
   final List<ToolCall>? toolCalls;
   final FinishReason? finishReason;
   final Usage? usage;

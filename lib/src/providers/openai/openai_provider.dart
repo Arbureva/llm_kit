@@ -44,7 +44,7 @@ class OpenAIProvider implements LlmProvider {
   /// parameter rules. Override by setting fields explicitly via ChatOptions.extra.
   bool _isReasoningModel(String model) {
     final m = model.toLowerCase();
-    return m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4') || m.startsWith('gpt-5');
+    return m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4') || m.startsWith('gpt-5') || m.startsWith('deepseek');
   }
 
   Map<String, dynamic> _buildBody(

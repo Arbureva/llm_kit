@@ -28,6 +28,24 @@ class ToolCall {
     'type': 'function',
     'function': {'name': name, 'arguments': arguments},
   };
+
+  /// Inverse of [toJson]. Also accepts a flat `{id, name, arguments}` shape so
+  /// you can persist history however you like and still read it back.
+  factory ToolCall.fromJson(Map<String, dynamic> json) {
+    final fn = json['function'];
+    if (fn is Map) {
+      return ToolCall(
+        id: json['id'] as String,
+        name: fn['name'] as String,
+        arguments: (fn['arguments'] as String?) ?? '',
+      );
+    }
+    return ToolCall(
+      id: json['id'] as String,
+      name: json['name'] as String,
+      arguments: (json['arguments'] as String?) ?? '',
+    );
+  }
 }
 
 /// The result of running a tool, fed back to the model.
@@ -43,6 +61,20 @@ class ToolResult {
   final String name;
   final String content;
   final bool isError;
+
+  Map<String, dynamic> toJson() => {
+    'tool_call_id': toolCallId,
+    'name': name,
+    'content': content,
+    'is_error': isError,
+  };
+
+  factory ToolResult.fromJson(Map<String, dynamic> json) => ToolResult(
+    toolCallId: json['tool_call_id'] as String,
+    name: json['name'] as String,
+    content: (json['content'] as String?) ?? '',
+    isError: (json['is_error'] as bool?) ?? false,
+  );
 }
 
 /// A single conversation turn.
@@ -58,6 +90,7 @@ class Message {
     this.toolCalls,
     this.toolResult,
     this.reasoning,
+    this.reasoningSignature,
   });
 
   final Role role;
@@ -78,7 +111,39 @@ class Message {
   /// chose to retain it. Not all providers round-trip this back.
   final String? reasoning;
 
+  /// Provider signature for the reasoning block (Anthropic). Must be retained
+  /// and fed back with the thinking block on the next turn when thinking is
+  /// used together with tools, or the request is rejected. Null for providers
+  /// that don't sign thinking, or when it wasn't captured.
+  final String? reasoningSignature;
+
   bool get hasToolCalls => toolCalls != null && toolCalls!.isNotEmpty;
+
+  /// Serialize for history persistence. Snake_case keys to match the wire
+  /// conventions and your backend's JSON tags.
+  Map<String, dynamic> toJson() => {
+    'role': role.name,
+    if (content != null) 'content': content,
+    if (name != null) 'name': name,
+    if (hasToolCalls) 'tool_calls': toolCalls!.map((t) => t.toJson()).toList(),
+    if (toolResult != null) 'tool_result': toolResult!.toJson(),
+    if (reasoning != null) 'reasoning': reasoning,
+    if (reasoningSignature != null) 'reasoning_signature': reasoningSignature,
+  };
+
+  factory Message.fromJson(Map<String, dynamic> json) => Message(
+    role: Role.values.byName(json['role'] as String),
+    content: json['content'] as String?,
+    name: json['name'] as String?,
+    toolCalls: (json['tool_calls'] as List?)
+        ?.map((e) => ToolCall.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    toolResult: json['tool_result'] == null
+        ? null
+        : ToolResult.fromJson(json['tool_result'] as Map<String, dynamic>),
+    reasoning: json['reasoning'] as String?,
+    reasoningSignature: json['reasoning_signature'] as String?,
+  );
 
   factory Message.system(String content) =>
       Message(role: Role.system, content: content);

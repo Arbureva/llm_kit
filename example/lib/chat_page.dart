@@ -3,6 +3,60 @@ import 'package:llm_kit/llm_kit.dart';
 
 import 'settings.dart';
 
+/// 前端（表单）工具的名字集合。它们的 schema 在本文件里声明并随请求发给模型，
+/// 但**没有本地 execute**——执行靠 dispatcher 路由到 FormBridge，弹表单收集用户输入。
+/// 接真实后端时，这些 schema 应改由后端注入；前端只需保留这份名字集合用于路由。
+const _frontendToolNames = {'collect_contact_info', 'pick_date'};
+
+/// 前端表单工具的 schema。
+///
+/// 注意：在你的真实架构里，**所有工具的 schema 由后端在它的 /chat 端点注入**，
+/// 前端发请求时不该再带 tools——前端只需保留上面那份 `_frontendToolNames`
+/// 用于在 dispatcher 里认出哪些 tool_call 要弹表单。
+///
+/// 但这个 demo 是直连 LLM（没有你的后端代理），模型不会凭空知道这些表单工具，
+/// 所以这里在前端声明一遍 schema 以便演示。接上后端后，删掉 `tools:` 传参、
+/// 把这些 schema 挪到后端注入即可。
+///
+/// 这些工具都不带 execute —— 所以执行会走 dispatcher，由 FormBridge 弹表单。
+final List<Tool> _formTools = [
+  Tool(
+    name: 'collect_contact_info',
+    description: '当需要用户提供联系资料（如姓名、电话、邮箱）以继续任务时调用。'
+        '会弹出一个表单让用户填写，填完后返回这些信息。',
+    parameters: {
+      'type': 'object',
+      'properties': {
+        'fields': {
+          'type': 'array',
+          'description': '需要收集的字段列表',
+          'items': {
+            'type': 'object',
+            'properties': {
+              'key': {'type': 'string', 'description': '字段标识，如 name / phone / email'},
+              'label': {'type': 'string', 'description': '显示给用户的中文标签'},
+              'required': {'type': 'boolean', 'description': '是否必填'},
+            },
+            'required': ['key', 'label'],
+          },
+        },
+        'reason': {'type': 'string', 'description': '向用户说明为什么需要这些资料'},
+      },
+      'required': ['fields'],
+    },
+  ),
+  Tool(
+    name: 'pick_date',
+    description: '当需要用户选择一个日期时调用，会弹出日期选择表单。',
+    parameters: {
+      'type': 'object',
+      'properties': {
+        'label': {'type': 'string', 'description': '让用户选什么日期，如「预约日期」'},
+      },
+    },
+  ),
+];
+
 /// 一条要显示在屏幕上的内容。我们不直接用库里的 Message，
 /// 而是用这个更适合「显示」的结构（带流式状态、思考内容、工具状态）。
 class UiBubble {
@@ -31,6 +85,9 @@ class UiToolCall {
 
   /// 是否是交给后端（dispatcher）执行的。本地执行的工具为 false。
   bool dispatched = false;
+
+  /// 是否是前端表单工具（用来给标签换个「等用户填表」的措辞和图标）。
+  bool isForm = false;
 }
 
 /// 工具调用的生命周期阶段，和库里的 SessionEvent 一一对应。
@@ -38,7 +95,7 @@ enum UiToolPhase {
   /// 模型刚开始请求（SessionToolCallStarted）—— 参数可能还没传完。
   requesting,
 
-  /// 参数已传完、正在执行（SessionToolCallExecuting）—— 后端跑工具的「空档期」就在这里。
+  /// 参数已传完、正在执行（SessionToolCallExecuting）—— 后端跑工具、或等用户填表的「空档期」就在这里。
   executing,
 
   /// 执行完成（SessionToolCallEnd）。
@@ -62,6 +119,10 @@ class _ChatPageState extends State<ChatPage> {
   final List<UiToolCall> _activeTools = [];
 
   ChatSession? _session;
+
+  /// 前端表单桥：dispatcher 把前端工具交给它，它通过 requests 流把表单请求送到 UI。
+  FormBridge? _forms;
+
   bool _busy = false;
 
   // 是否展开思考面板（每条助手消息一个开关，简单起见用 index 记）。
@@ -71,36 +132,73 @@ class _ChatPageState extends State<ChatPage> {
   void dispose() {
     _inputCtrl.dispose();
     _scrollCtrl.dispose();
+    _forms?.dispose();
     super.dispose();
   }
 
-  /// 把当前配置应用上：新建一个 session（带上示例工具）。
+  /// 把当前配置应用上：新建一个 session（带上表单工具 + 表单桥 + dispatcher）。
   void _rebuildSession() {
     final provider = _settings.buildProvider();
+
+    // 旧的表单桥先关掉，避免泄漏 StreamController。
+    _forms?.dispose();
+    final forms = FormBridge();
+    _forms = forms;
+
     _session = ChatSession(
       provider,
-      // tools: [weatherTool],
-      // 没有本地 execute 的工具会走到这里 —— 你的后端（MCP / CLI / skills）在此执行。
-      // 示例工具 weatherTool 自带 execute，所以不会用到这个；
-      // 接后端时把下面替换成真正的调用即可。
-      dispatcher: _dispatchTool,
+      // 把前端表单工具的 schema 交给模型；它们没有 execute，所以执行会走 dispatcher。
+      // 接真实后端时，把后端工具 schema 也一起注入（通常由后端代理 /chat 端点完成）。
+      tools: _formTools,
+      dispatcher: (call) => _dispatchTool(call, forms),
     );
-    _session!.setSystem('你是一个简洁友好的中文助手。');
+    _session!.setSystem(
+      '你是一个简洁友好的中文助手。当任务需要用户提供资料时，'
+      '请调用 collect_contact_info 收集联系方式，或调用 pick_date 让用户选日期，'
+      '不要自己编造用户的资料。',
+    );
+
+    // 监听表单请求：模型一旦调用前端工具，这里就会收到一个 FormRequest，弹出表单。
+    forms.requests.listen(_onFormRequested);
   }
 
-  /// 后端工具派发：AI 请求一个没有本地 execute 的工具时被调用。
-  /// 在这里调用你的后端（MCP / CLI / skills），拿到结果后返回 ToolResult，
-  /// session 会自动把结果喂回模型并继续这一轮。
-  Future<ToolResult> _dispatchTool(ToolCall call) async {
-    // TODO: 换成你真正的后端调用，例如：
-    //   final out = await backend.runTool(call.name, call.arguments);
-    //   return ToolResult(toolCallId: call.id, name: call.name, content: out);
-    return ToolResult(
-      toolCallId: call.id,
-      name: call.name,
-      content: '（占位）后端尚未接入，工具 "${call.name}" 未执行。',
-      isError: true,
+  /// 工具派发：按工具名分流。
+  ///   - 前端表单工具 → 交给 FormBridge，弹表单、挂起循环、等用户提交。
+  ///   - 其余（后端工具）→ 返回 null「跳过」：这个 tool_call 原样留在 assistant 轮里、
+  ///     不回填任何结果。本次 send 会以 handedOffToBackend 结束；
+  ///     你把当前 messages 再发一次给后端时，后端发现末尾的 tool_call 还没结果，
+  ///     就自己执行、把结果拼回去、再发起 AI 请求。前端全程不碰这个工具。
+  Future<ToolResult?> _dispatchTool(ToolCall call, FormBridge forms) async {
+    if (_frontendToolNames.contains(call.name)) {
+      // collect() 返回的 Future 会一直挂着，直到用户在表单上提交或取消。
+      // 循环就停在这一步，不需要任何额外的暂停/恢复机制。
+      return forms.collect(call);
+    }
+    // 后端工具：不归前端管，跳过。
+    return null;
+  }
+
+  /// 收到表单请求时弹出底部表单。用户提交→req.submit(values)，取消→req.cancel()。
+  Future<void> _onFormRequested(FormRequest req) async {
+    if (!mounted) {
+      req.cancel('页面已关闭。');
+      return;
+    }
+
+    final result = await showModalBottomSheet<Map<String, dynamic>>(
+      context: context,
+      isScrollControlled: true,
+      // 用户点空白关闭时返回 null，下面按取消处理。
+      builder: (ctx) => _FormSheet(request: req),
     );
+
+    if (req.isResolved) return; // 已在表单内部 submit/cancel 过
+
+    if (result == null) {
+      req.cancel('用户关闭了表单。');
+    } else {
+      req.submit(result);
+    }
   }
 
   void _scrollToBottom() {
@@ -160,7 +258,10 @@ class _ChatPageState extends State<ChatPage> {
 
           case SessionToolCallStarted(:final id, :final name):
             // 模型一开始请求工具就冒出标签（此时参数可能还没传完）。
-            setState(() => _activeTools.add(UiToolCall(id: id, name: name)));
+            setState(() {
+              final t = UiToolCall(id: id, name: name)..isForm = _frontendToolNames.contains(name);
+              _activeTools.add(t);
+            });
             _scrollToBottom();
 
           case SessionToolCallReady():
@@ -169,7 +270,7 @@ class _ChatPageState extends State<ChatPage> {
             break;
 
           case SessionToolCallExecuting(:final id, :final name, :final dispatched):
-            // 真正开始执行（本地或交给后端）—— 之前的「空档期」就发生在这一阶段。
+            // 真正开始执行（本地 / 后端 / 等用户填表）—— 之前的「空档期」就在这一阶段。
             setState(() {
               final t = _findOrAddTool(id, name);
               t.phase = UiToolPhase.executing;
@@ -188,6 +289,13 @@ class _ChatPageState extends State<ChatPage> {
             // 轮次用尽（而非正常结束）时给个提示，避免回复像是无故截断。
             if (reason == SessionStopReason.maxRoundsReached) {
               setState(() => assistant.text += '\n\n⚠️ 工具调用轮次已达上限，回复可能未完成。');
+            } else if (reason == SessionStopReason.handedOffToBackend) {
+              // 模型调了后端工具：当前 messages 里留着没结果的 tool_call。
+              // 真实接入时，这里应把 _session!.messages 再发一次给后端，
+              // 后端执行该工具、回填结果后，再用 _session!.resume() 续跑这一轮。
+              // 本地直连 LLM 的 demo 没有后端，所以只做个提示。
+              // setState(() => assistant.text += '\n\n🔁 模型请求了后端工具，已交给后端处理（demo 未接后端，'
+              //     '真实环境请重发 messages 给后端并 resume）。');
             }
 
           case SessionError(:final error):
@@ -214,7 +322,7 @@ class _ChatPageState extends State<ChatPage> {
         return t;
       }
     }
-    final t = UiToolCall(id: id, name: name);
+    final t = UiToolCall(id: id, name: name)..isForm = _frontendToolNames.contains(name);
     _activeTools.add(t);
     return t;
   }
@@ -272,7 +380,8 @@ class _ChatPageState extends State<ChatPage> {
           padding: EdgeInsets.all(32),
           child: Text(
             '在顶部填好 Key 和模型，然后发条消息试试。\n'
-            '想看工具调用效果，可以问："东京天气怎么样？"',
+            '想看工具调用效果，可以问："东京天气怎么样？"\n'
+            '想看表单效果，可以说："帮我预约，需要我的联系方式"',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.black54),
           ),
@@ -400,13 +509,19 @@ class _ChatPageState extends State<ChatPage> {
         );
         label = '请求调用：${t.name}…';
       case UiToolPhase.executing:
-        avatar = const SizedBox(
-          width: 16,
-          height: 16,
-          child: CircularProgressIndicator(strokeWidth: 2),
-        );
-        // 区分本地执行 / 后端执行，让「空档期」有明确说明。
-        label = t.dispatched ? '后端执行中：${t.name}…' : '执行中：${t.name}…';
+        if (t.isForm) {
+          // 等用户填表：用一个明确的「待填写」图标，而不是转圈。
+          avatar = const Icon(Icons.edit_note, size: 18, color: Colors.indigo);
+          label = '请填写表单：${t.name}…';
+        } else {
+          avatar = const SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          );
+          // 区分本地执行 / 后端执行，让「空档期」有明确说明。
+          label = t.dispatched ? '后端执行中：${t.name}…' : '执行中：${t.name}…';
+        }
       case UiToolPhase.done:
         avatar = Icon(
           t.isError ? Icons.error_outline : Icons.check_circle,
@@ -470,6 +585,245 @@ class _ChatPageState extends State<ChatPage> {
         ),
       ),
     );
+  }
+}
+
+/// 表单底部弹窗：根据工具的参数动态生成输入项。
+///
+/// - collect_contact_info：按 arguments['fields'] 渲染若干文本框。
+/// - pick_date：渲染一个日期选择按钮。
+/// - 其它前端工具：兜底渲染一个「补充说明」文本框，避免无法继续。
+///
+/// 提交时把收集到的值组成 Map，由调用方 submit 回模型。
+class _FormSheet extends StatefulWidget {
+  const _FormSheet({required this.request});
+  final FormRequest request;
+
+  @override
+  State<_FormSheet> createState() => _FormSheetState();
+}
+
+class _FormSheetState extends State<_FormSheet> {
+  // 文本字段的控制器，key 与字段 key 一致。
+  final Map<String, TextEditingController> _ctrls = {};
+  // 哪些字段必填，用于校验。
+  final Map<String, bool> _requiredFlags = {};
+  // pick_date 选中的日期。
+  DateTime? _pickedDate;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.request.name == 'collect_contact_info') {
+      for (final f in _fields) {
+        final key = f['key'] as String;
+        _ctrls[key] = TextEditingController();
+        _requiredFlags[key] = (f['required'] as bool?) ?? false;
+      }
+    } else if (widget.request.name != 'pick_date') {
+      // 兜底：未知前端工具，给一个自由文本框。
+      _ctrls['value'] = TextEditingController();
+      _requiredFlags['value'] = true;
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final c in _ctrls.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  /// collect_contact_info 的字段列表；模型没给就用一组默认。
+  List<Map<String, dynamic>> get _fields {
+    final raw = widget.request.arguments['fields'];
+    if (raw is List && raw.isNotEmpty) {
+      return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+    }
+    return const [
+      {'key': 'name', 'label': '姓名', 'required': true},
+      {'key': 'phone', 'label': '电话', 'required': true},
+      {'key': 'email', 'label': '邮箱', 'required': false},
+    ];
+  }
+
+  String get _title {
+    switch (widget.request.name) {
+      case 'collect_contact_info':
+        return '请填写联系资料';
+      case 'pick_date':
+        final label = widget.request.arguments['label'];
+        return label is String && label.isNotEmpty ? label : '请选择日期';
+      default:
+        return '请补充信息';
+    }
+  }
+
+  String? get _reason {
+    final r = widget.request.arguments['reason'];
+    return r is String && r.isNotEmpty ? r : null;
+  }
+
+  void _submit() {
+    final name = widget.request.name;
+
+    if (name == 'pick_date') {
+      if (_pickedDate == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('请先选择一个日期')),
+        );
+        return;
+      }
+      final iso = _pickedDate!.toIso8601String().split('T').first;
+      widget.request.submit({'date': iso});
+      Navigator.of(context).pop({'date': iso}); // 关闭弹窗（pop 的值仅作冗余）
+      return;
+    }
+
+    // 文本字段：校验必填。
+    final values = <String, dynamic>{};
+    for (final entry in _ctrls.entries) {
+      final v = entry.value.text.trim();
+      if ((_requiredFlags[entry.key] ?? false) && v.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('「${_labelOf(entry.key)}」为必填项')),
+        );
+        return;
+      }
+      values[entry.key] = v;
+    }
+    widget.request.submit(values);
+    Navigator.of(context).pop(values);
+  }
+
+  void _cancel() {
+    widget.request.cancel();
+    Navigator.of(context).pop(); // 返回 null
+  }
+
+  String _labelOf(String key) {
+    if (widget.request.name == 'collect_contact_info') {
+      for (final f in _fields) {
+        if (f['key'] == key) return (f['label'] as String?) ?? key;
+      }
+    }
+    return key;
+  }
+
+  Future<void> _pickDate() async {
+    final now = DateTime.now();
+    final d = await showDatePicker(
+      context: context,
+      initialDate: _pickedDate ?? now,
+      firstDate: now.subtract(const Duration(days: 365)),
+      lastDate: now.add(const Duration(days: 365 * 3)),
+    );
+    if (d != null) setState(() => _pickedDate = d);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 让弹窗在键盘弹出时往上顶，避免输入框被遮住。
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 16,
+        right: 16,
+        top: 16,
+        bottom: 16 + bottomInset,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.assignment_outlined, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  _title,
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                ),
+              ),
+              IconButton(
+                onPressed: _cancel,
+                icon: const Icon(Icons.close),
+                tooltip: '取消',
+              ),
+            ],
+          ),
+          if (_reason != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              _reason!,
+              style: const TextStyle(fontSize: 13, color: Colors.black54),
+            ),
+          ],
+          const SizedBox(height: 12),
+          ..._buildInputs(),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _cancel,
+                  child: const Text('取消'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton(
+                  onPressed: _submit,
+                  child: const Text('提交'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _buildInputs() {
+    if (widget.request.name == 'pick_date') {
+      return [
+        InkWell(
+          onTap: _pickDate,
+          child: InputDecorator(
+            decoration: const InputDecoration(
+              labelText: '日期',
+              isDense: true,
+              border: OutlineInputBorder(),
+              suffixIcon: Icon(Icons.calendar_today, size: 18),
+            ),
+            child: Text(
+              _pickedDate == null ? '点击选择' : _pickedDate!.toIso8601String().split('T').first,
+              style: TextStyle(
+                color: _pickedDate == null ? Colors.black45 : Colors.black87,
+              ),
+            ),
+          ),
+        ),
+      ];
+    }
+
+    // collect_contact_info / 兜底：文本框列表。
+    return _ctrls.entries.map((e) {
+      final required = _requiredFlags[e.key] ?? false;
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: TextField(
+          controller: e.value,
+          decoration: InputDecoration(
+            labelText: _labelOf(e.key) + (required ? ' *' : ''),
+            isDense: true,
+            border: const OutlineInputBorder(),
+          ),
+        ),
+      );
+    }).toList();
   }
 }
 

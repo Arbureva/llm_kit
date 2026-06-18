@@ -7,22 +7,28 @@ import '../core/stream_event.dart';
 
 /// How a requested tool gets executed.
 ///
-/// Most apps fall into one of two modes, and a single session can mix them:
+/// Three outcomes, and a single session can mix them:
 ///
 ///  * **Local** — the [Tool] carries an [Tool.execute] handler and the session
 ///    runs it in-process. Good for trivial, synchronous-ish tools.
 ///
-///  * **Dispatched** — the tool is executed *elsewhere* (your backend running
-///    MCP servers, a CLI, skills, a remote worker) and the result is handed
-///    back to the session to continue the loop. This is the common case when
-///    the Flutter client itself never touches the tool. Provide a
-///    [ToolDispatcher] for it.
+///  * **Dispatched (handled here)** — the [ToolDispatcher] returns a
+///    [ToolResult]. Use this for tools the *client* fulfils interactively,
+///    such as a form the user fills in. The result is fed back to the model
+///    and the loop continues.
+///
+///  * **Dispatched (skipped)** — the [ToolDispatcher] returns `null`, meaning
+///    "not my job". This is the case for backend tools in a setup where the
+///    frontend posts messages to a backend that runs the tool and feeds the
+///    result back itself. The session does NOT fabricate a result; it leaves
+///    the unhandled tool call in the assistant turn and ends this `send`. Your
+///    next request to the backend carries that pending call, and the backend
+///    executes it and continues. See [ChatSession] docs for the full flow.
 ///
 /// Resolution order per call: a matching [Tool.execute] wins; otherwise the
-/// [ToolDispatcher] is used; if neither exists the call is reported as an
-/// error result and fed back to the model so the conversation can recover
-/// instead of silently stalling.
-typedef ToolDispatcher = Future<ToolResult> Function(ToolCall call);
+/// [ToolDispatcher] is consulted. A null dispatcher, or a dispatcher that
+/// returns null, means the call is left for something downstream to handle.
+typedef ToolDispatcher = Future<ToolResult?> Function(ToolCall call);
 
 /// Lifecycle events a UI can observe to render rich, interactive chat.
 ///
@@ -146,6 +152,14 @@ enum SessionStopReason {
   /// [ChatSession.maxToolRounds] was hit before the model stopped calling
   /// tools. The last assistant turn may be incomplete.
   maxRoundsReached,
+
+  /// The turn ended with one or more tool calls the frontend does not handle
+  /// (the dispatcher returned null for them, or there was no dispatcher).
+  /// Those calls remain in the assistant turn; the expectation is that the
+  /// next request to your backend carries this history, the backend executes
+  /// the pending tool(s), feeds the result(s) back, and continues. Call
+  /// [ChatSession.resume] when control returns to the frontend.
+  handedOffToBackend,
 }
 
 /// A lightweight, framework-agnostic conversation manager.
@@ -221,14 +235,20 @@ class ChatSession {
   Stream<SessionEvent> resume({ChatOptions? options}) => _run(options: options);
 
   Stream<SessionEvent> _run({ChatOptions? options}) async* {
-    // 前端是否有能力执行工具。两者皆无 = 后端在跑循环、并把最终答案随流一起返回，
-    // 流里的 tool_calls 仅供展示：绝不能再循环，也绝不能把这些 tool_calls 落进历史
-    // （它们没有对应的 tool 结果，下一次请求会变成「assistant(tool_calls) 后面没有 tool 消息」→ 400）。
+    // 前端是否参与工具循环。
+    //   有 execute 或有 dispatcher = 前端跑循环：本地工具就地执行，
+    //   表单类前端工具由 dispatcher 返回结果，后端工具由 dispatcher 返回 null
+    //   「跳过」——把它原样留在 assistant 轮里、不回填，然后结束本次 send，
+    //   交由后端在下一次请求时执行并续跑（见 handedOffToBackend）。
+    //   两者皆无 = 纯展示直通：后端已跑完循环、把最终文本随流返回，
+    //   流里的 tool_calls 仅供展示，绝不落进历史（否则会得到
+    //   「assistant(tool_calls) 后面没有 tool 消息」→ 400）。
     final canExecuteTools = _tools.any((t) => t.execute != null) || dispatcher != null;
 
     for (var round = 0; round < maxToolRounds; round++) {
       final textBuf = StringBuffer();
       final reasoningBuf = StringBuffer();
+      String? reasoningSignature;
       final pending = <ToolCall>[];
       Usage? usage;
 
@@ -239,19 +259,40 @@ class ChatSession {
           tools: _tools.isEmpty ? null : _tools,
         )) {
           switch (ev) {
+            /// 普通
             case TextDelta(:final text):
               textBuf.write(text);
               yield SessionText(text);
+
+            /// 深度思考
             case ReasoningDelta(:final text):
               reasoningBuf.write(text);
               yield SessionReasoning(text);
+
+            /// 深度思考签名
+            case ReasoningSignature(:final signature):
+              reasoningSignature = signature; // 回传 thinking 块所必需
+
+            /// 工具调用开始
             case ToolCallStarted(:final id, :final name):
               yield SessionToolCallStarted(id: id, name: name); // 仍可显示「正在调用…」
+
+            /// 工具调用结束
             case ToolCallCompleted(:final toolCall):
               pending.add(toolCall);
+
+            /// 权威消息
+            case ChunkMessage(:final message):
+              _messages.add(message);
+
+            /// 流停止
             case StreamDone(usage: final u):
               usage = u;
+
+            /// 工具参数
             case ToolCallArgumentsDelta():
+
+            /// 流提醒
             case StreamNotice():
               break;
           }
@@ -283,6 +324,7 @@ class ChatSession {
           content: textBuf.isEmpty ? null : textBuf.toString(),
           toolCalls: pending.isEmpty ? null : pending,
           reasoning: reasoningBuf.isEmpty ? null : reasoningBuf.toString(),
+          reasoningSignature: reasoningSignature, // 下一轮回传 thinking 块所必需
         ));
       }
 
@@ -293,6 +335,7 @@ class ChatSession {
       }
 
       // Resolve and run each requested tool, feeding results back.
+      var handedOff = false;
       for (final call in pending) {
         // Arguments are fully streamed by now; surface them before running.
         Map<String, dynamic>? parsed;
@@ -310,54 +353,85 @@ class ChatSession {
 
         final tool = _tools.where((t) => t.name == call.name).firstOrNull;
         final hasLocal = tool?.execute != null;
-        final canDispatch = !hasLocal && dispatcher != null;
 
-        // Announce execution start so a backend round-trip isn't a blank gap.
-        if (hasLocal || canDispatch) {
+        if (hasLocal) {
           yield SessionToolCallExecuting(
             id: call.id,
             name: call.name,
-            dispatched: canDispatch,
+            dispatched: false,
           );
-        }
-
-        String resultText;
-        var isError = false;
-
-        if (hasLocal) {
+          String resultText;
+          var isError = false;
           try {
-            final args = parsed ?? <String, dynamic>{};
-            resultText = await tool!.execute!(args);
+            resultText = await tool!.execute!(parsed ?? <String, dynamic>{});
           } catch (e) {
             resultText = 'Tool execution failed: $e';
             isError = true;
           }
-        } else if (canDispatch) {
-          try {
-            final r = await dispatcher!(call);
-            resultText = r.content;
-            isError = r.isError;
-          } catch (e) {
-            resultText = 'Tool dispatch failed: $e';
-            isError = true;
-          }
-        } else {
-          resultText = 'No executor or dispatcher registered for tool "${call.name}".';
-          isError = true;
+          _messages.add(Message.tool(ToolResult(
+            toolCallId: call.id,
+            name: call.name,
+            content: resultText,
+            isError: isError,
+          )));
+          yield SessionToolCallEnd(
+            id: call.id,
+            name: call.name,
+            result: resultText,
+            isError: isError,
+          );
+          continue;
         }
 
-        _messages.add(Message.tool(ToolResult(
-          toolCallId: call.id,
-          name: call.name,
-          content: resultText,
-          isError: isError,
-        )));
-        yield SessionToolCallEnd(
-          id: call.id,
-          name: call.name,
-          result: resultText,
-          isError: isError,
-        );
+        // No local handler. Ask the dispatcher — but it may decline (null),
+        // meaning "not the frontend's job; leave it for the backend".
+        ToolResult? dispatched;
+        if (dispatcher != null) {
+          yield SessionToolCallExecuting(
+            id: call.id,
+            name: call.name,
+            dispatched: true,
+          );
+          try {
+            dispatched = await dispatcher!(call);
+          } catch (e) {
+            // A dispatcher that throws is treated as a handled error result,
+            // not a hand-off — the frontend tried and failed.
+            dispatched = ToolResult(
+              toolCallId: call.id,
+              name: call.name,
+              content: 'Tool dispatch failed: $e',
+              isError: true,
+            );
+          }
+        }
+
+        if (dispatched != null) {
+          // Frontend handled it (e.g. a form). Feed the result back.
+          _messages.add(Message.tool(dispatched));
+          yield SessionToolCallEnd(
+            id: call.id,
+            name: call.name,
+            result: dispatched.content,
+            isError: dispatched.isError,
+          );
+        } else {
+          // Unhandled: leave the tool call in the assistant turn with NO
+          // tool result. The backend will execute it on the next request.
+          // Do not fabricate a result — that would consume the pending call
+          // and break the backend's "is this call still pending?" check.
+          handedOff = true;
+        }
+      }
+
+      // If any call this round was left for the backend, stop here: the
+      // frontend's job is done until the backend executes it and we're driven
+      // again (call resume() when control returns). Looping now would either
+      // spin or resend an assistant turn whose tool calls have no results.
+      if (handedOff) {
+        if (title == null) yield* _ensureTitle(options);
+        yield SessionDone(usage: usage, reason: SessionStopReason.handedOffToBackend);
+        return;
       }
       // Loop again so the model can use the tool results.
     }

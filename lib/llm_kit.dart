@@ -23,3 +23,4 @@ export 'src/providers/anthropic/anthropic_provider.dart';
 
 // Optional session layer
 export 'src/session/chat_session.dart';
+export 'src/session/form_bridge.dart';

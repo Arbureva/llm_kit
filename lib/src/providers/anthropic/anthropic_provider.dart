@@ -39,20 +39,20 @@ class AnthropicProvider implements LlmProvider {
   final Duration? timeout;
 
   Map<String, String> _headers() => {
-    'Content-Type': 'application/json',
-    'x-api-key': apiKey,
-    'anthropic-version': version,
-    ...defaultHeaders,
-  };
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': version,
+        ...defaultHeaders,
+      };
 
   /// Map the neutral ReasoningEffort to a thinking token budget. Rough but
   /// reasonable defaults; override precisely via ChatOptions.extra['thinking'].
   int _thinkingBudget(ReasoningEffort effort) => switch (effort) {
-    ReasoningEffort.minimal => 1024,
-    ReasoningEffort.low => 4096,
-    ReasoningEffort.medium => 10000,
-    ReasoningEffort.high => 24000,
-  };
+        ReasoningEffort.minimal => 1024,
+        ReasoningEffort.low => 4096,
+        ReasoningEffort.medium => 10000,
+        ReasoningEffort.high => 24000,
+      };
 
   Map<String, dynamic> _buildBody(
     List<Message> messages, {
@@ -61,10 +61,7 @@ class AnthropicProvider implements LlmProvider {
     required bool stream,
   }) {
     // Pull system messages out into the top-level system field.
-    final systemParts = messages
-        .where((m) => m.role == Role.system && m.content != null)
-        .map((m) => m.content!)
-        .toList();
+    final systemParts = messages.where((m) => m.role == Role.system && m.content != null).map((m) => m.content!).toList();
     final convo = messages.where((m) => m.role != Role.system).toList();
 
     final body = <String, dynamic>{
@@ -79,8 +76,7 @@ class AnthropicProvider implements LlmProvider {
     if (options?.topP != null) body['top_p'] = options!.topP;
     if (options?.stop != null) body['stop_sequences'] = options!.stop;
 
-    if (options?.reasoningEffort != null &&
-        (options?.extra?['thinking'] == null)) {
+    if (options?.reasoningEffort != null && (options?.extra?['thinking'] == null)) {
       body['thinking'] = {
         'type': 'enabled',
         'budget_tokens': _thinkingBudget(options!.reasoningEffort!),
@@ -105,11 +101,11 @@ class AnthropicProvider implements LlmProvider {
   }
 
   dynamic _toolChoice(String choice) => switch (choice) {
-    'auto' => {'type': 'auto'},
-    'none' => {'type': 'none'},
-    'required' => {'type': 'any'},
-    _ => {'type': 'tool', 'name': choice},
-  };
+        'auto' => {'type': 'auto'},
+        'none' => {'type': 'none'},
+        'required' => {'type': 'any'},
+        _ => {'type': 'tool', 'name': choice},
+      };
 
   /// Build Anthropic's content-block message array. Consecutive tool results
   /// are coalesced into a single user turn, as the API expects.
@@ -125,18 +121,30 @@ class AnthropicProvider implements LlmProvider {
           if (m.toolResult!.isError) 'is_error': true,
         };
         // Append to a trailing user turn if one is open, else start a new one.
-        if (out.isNotEmpty &&
-            out.last['role'] == 'user' &&
-            out.last['content'] is List) {
+        if (out.isNotEmpty && out.last['role'] == 'user' && out.last['content'] is List) {
           (out.last['content'] as List).add(block);
         } else {
-          out.add({'role': 'user', 'content': [block]});
+          out.add({
+            'role': 'user',
+            'content': [block]
+          });
         }
         continue;
       }
 
       if (m.role == Role.assistant) {
         final blocks = <Map<String, dynamic>>[];
+        // Thinking must come first, and only with its signature — Anthropic
+        // rejects a thinking block without one, and rejects a thinking+tools
+        // assistant turn fed back without the thinking block. So: include it
+        // when we have both, skip it otherwise.
+        if (m.reasoning != null && m.reasoning!.isNotEmpty && m.reasoningSignature != null && m.reasoningSignature!.isNotEmpty) {
+          blocks.add({
+            'type': 'thinking',
+            'thinking': m.reasoning,
+            'signature': m.reasoningSignature,
+          });
+        }
         if (m.content != null && m.content!.isNotEmpty) {
           blocks.add({'type': 'text', 'text': m.content});
         }
@@ -146,9 +154,7 @@ class AnthropicProvider implements LlmProvider {
               'type': 'tool_use',
               'id': tc.id,
               'name': tc.name,
-              'input': tc.arguments.isEmpty
-                  ? <String, dynamic>{}
-                  : jsonDecode(tc.arguments),
+              'input': tc.arguments.isEmpty ? <String, dynamic>{} : jsonDecode(tc.arguments),
             });
           }
         }
@@ -182,6 +188,7 @@ class AnthropicProvider implements LlmProvider {
 
     final textBuf = StringBuffer();
     final reasoningBuf = StringBuffer();
+    String? reasoningSignature;
     final toolCalls = <ToolCall>[];
 
     for (final block in content) {
@@ -190,6 +197,8 @@ class AnthropicProvider implements LlmProvider {
           textBuf.write(block['text'] ?? '');
         case 'thinking':
           reasoningBuf.write(block['thinking'] ?? '');
+          final sig = block['signature'] as String?;
+          if (sig != null && sig.isNotEmpty) reasoningSignature = sig;
         case 'tool_use':
           toolCalls.add(ToolCall(
             id: block['id'] as String,
@@ -202,6 +211,7 @@ class AnthropicProvider implements LlmProvider {
     return ChatResult(
       content: textBuf.toString(),
       reasoning: reasoningBuf.isEmpty ? null : reasoningBuf.toString(),
+      reasoningSignature: reasoningSignature,
       toolCalls: toolCalls.isEmpty ? null : toolCalls,
       finishReason: _stopReason(json['stop_reason'] as String?),
       usage: _parseUsage(json['usage']),
@@ -221,13 +231,13 @@ class AnthropicProvider implements LlmProvider {
   }
 
   FinishReason? _stopReason(String? r) => switch (r) {
-    'end_turn' => FinishReason.stop,
-    'stop_sequence' => FinishReason.stop,
-    'max_tokens' => FinishReason.length,
-    'tool_use' => FinishReason.toolCalls,
-    null => null,
-    _ => FinishReason.unknown,
-  };
+        'end_turn' => FinishReason.stop,
+        'stop_sequence' => FinishReason.stop,
+        'max_tokens' => FinishReason.length,
+        'tool_use' => FinishReason.toolCalls,
+        null => null,
+        _ => FinishReason.unknown,
+      };
 
   @override
   Stream<StreamEvent> chatStream(
@@ -249,6 +259,7 @@ class AnthropicProvider implements LlmProvider {
     final toolNames = <int, String>{};
     final toolArgs = <int, StringBuffer>{};
     final isToolBlock = <int, bool>{};
+    final sigBuf = <int, StringBuffer>{};
     FinishReason? finish;
     Usage? usage;
 
@@ -296,8 +307,13 @@ class AnthropicProvider implements LlmProvider {
                 toolArgs[index]?.write(frag);
                 yield ToolCallArgumentsDelta(index: index, delta: frag);
               }
-            // signature_delta is retained by SDKs to round-trip thinking;
-            // for streaming display we don't need to surface it.
+            case 'signature_delta':
+              // Accumulate the thinking block's signature; surfaced at
+              // content_block_stop so it can be round-tripped next turn.
+              final sig = delta['signature'] as String?;
+              if (sig != null && sig.isNotEmpty) {
+                (sigBuf[index] ??= StringBuffer()).write(sig);
+              }
           }
 
         case 'content_block_stop':
@@ -308,6 +324,8 @@ class AnthropicProvider implements LlmProvider {
               name: toolNames[index] ?? '',
               arguments: toolArgs[index]?.toString() ?? '{}',
             ));
+          } else if (sigBuf[index] != null && sigBuf[index]!.isNotEmpty) {
+            yield ReasoningSignature(sigBuf[index]!.toString());
           }
 
         case 'message_delta':
@@ -327,8 +345,7 @@ class AnthropicProvider implements LlmProvider {
           break;
 
         case 'error':
-          final msg = (obj['error'] as Map?)?['message']?.toString() ??
-              'stream error';
+          final msg = (obj['error'] as Map?)?['message']?.toString() ?? 'stream error';
           throw TransportException(msg);
       }
     }

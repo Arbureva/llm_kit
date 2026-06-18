@@ -41,6 +41,11 @@ class TextDelta extends StreamEvent {
   final String text;
 }
 
+class ChunkMessage extends StreamEvent {
+  final Message message;
+  ChunkMessage(this.message);
+}
+
 /// An incremental chunk of reasoning / thinking text.
 ///
 /// Emitted by reasoning models that stream their thinking (Anthropic extended
@@ -50,6 +55,16 @@ class TextDelta extends StreamEvent {
 class ReasoningDelta extends StreamEvent {
   const ReasoningDelta(this.text);
   final String text;
+}
+
+/// The signature of the just-completed reasoning/thinking block (Anthropic).
+/// Fires once when the thinking block closes. Retain it and feed it back with
+/// the thinking block on the next turn — required when thinking is enabled
+/// together with tools, otherwise the follow-up request is rejected. Providers
+/// that don't sign thinking never emit this.
+class ReasoningSignature extends StreamEvent {
+  const ReasoningSignature(this.signature);
+  final String signature;
 }
 
 /// Signals that the model has begun a tool call. Fires once per call as soon
